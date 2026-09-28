@@ -1,0 +1,9 @@
+@GetMapping("/{id}")
+public ResponseEntity<PaymentEntity> getPaymentById(@PathVariable String id) {
+    return paymentRepository.findById(id)
+            .map(ResponseEntity::ok)
+            .orElseThrow(() -> new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "Payment not found: " + id
+            ));
+}

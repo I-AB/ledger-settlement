@@ -1,0 +1,15 @@
+spring:
+  application:
+    name: ledger-settlement
+  datasource:
+    url: jdbc:postgresql://localhost:5433/ledger
+    username: ledger
+    password: ledger
+  jpa:
+    open-in-view: false
+  sql:
+    init:
+      mode: always
+
+ledger:
+  fee-rate: 0.031
