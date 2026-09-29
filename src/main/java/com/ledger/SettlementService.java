@@ -33,6 +33,8 @@ public class SettlementService {
 
     @Transactional(readOnly = true)
     public long owedMinor(String merchantId) {
+        int tableVersion = FeeScheduleLookup.TABLE_VERSION;
+
         List<PaymentEntity> payments = repository.findByMerchantId(merchantId);
         if (payments.isEmpty()) {
             throw new MerchantNotFoundException(merchantId);
