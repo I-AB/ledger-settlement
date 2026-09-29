@@ -34,3 +34,20 @@ No `server.tomcat.threads.*` properties are overridden in `application.yml`, so 
 | Queue capacity (accept-count) | 100 (documented Tomcat/Spring Boot default) | Not independently measured; would require deliberately exceeding 300 concurrent connections to observe queuing/rejection behavior, which was out of scope for this check |
 
 The 200-thread ceiling matches what the baseline load test already showed indirectly: a clean 200-VU run completes with 0% failures, but running a JVM thread dump mid-load (which briefly pauses the JVM at a safepoint) pushed a run at the same load to 0.36% failures and a 4.99s max latency, consistent with the pool having zero headroom at 200 concurrent requests.
+
+
+## Task 5: post-migration load test comparison
+
+Same test as the baseline: k6, 200 VUs, 60s, against GET /payments/settlement?merchantId=MR-4471, run immediately after enabling spring.threads.virtual.enabled=true and restarting the service.
+
+| Metric | Baseline (platform threads) | Post-migration (virtual threads) |
+|---|---|---|
+| Throughput | 701.73 req/s | 626.38 req/s |
+| p50 latency | 267.4 ms | 291.53 ms |
+| p90 latency | 389.83 ms | 419.82 ms |
+| p95 latency | 455.02 ms | 526.14 ms |
+| p99 latency | 582.42 ms | 797.95 ms |
+| Max latency | 1.35 s | 1.96 s |
+| Failed checks | 0.00% | 0.00% |
+
+Result: throughput and latency got worse across every percentile after enabling virtual threads. Not explained yet, per the lab instructions.
