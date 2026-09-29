@@ -51,3 +51,29 @@ Same test as the baseline: k6, 200 VUs, 60s, against GET /payments/settlement?me
 | Failed checks | 0.00% | 0.00% |
 
 Result: throughput and latency got worse across every percentile after enabling virtual threads. Not explained yet, per the lab instructions.
+
+
+## Task 8: captured pinned event
+
+Recording: pinned.jfr, captured via jcmd JFR.start/JFR.stop while a fresh, cold-start service was hit with 200 concurrent VUs for 20s (k6), before FeeScheduleLookup had ever been touched.
+
+Two related event shapes appeared, both for the same root cause:
+
+1. The one virtual thread that actually ran the static initializer:
+    - Duration: 325.002 ms
+    - Pinned Reason: "VM call to com.ledger.FeeScheduleLookup.<clinit> on stack"
+    - Stack trace: void java.lang.VirtualThread.sleepNanos(long)
+      void java.lang.Thread.sleepNanos(long)
+      void java.lang.Thread.sleep(long)
+      int com.ledger.FeeScheduleLookup.fetchTable()
+      void com.ledger.FeeScheduleLookup.<clinit>()
+      long com.ledger.SettlementService.owedMinor(String)
+2. Roughly 199 other virtual threads that arrived while the first was still initializing:
+    - Duration: 372.022 ms, 370.659 ms, 370.554 ms (and more)
+    - Pinned Reason: "Waited for initialization of com.ledger.FeeScheduleLookup by another thread"
+
+The frame that cannot unmount is FeeScheduleLookup.<clinit>, the class's static initializer. The call blocking inside it is Thread.sleep(300), invoked from fetchTable(). HotSpot's class initialization is guarded by an internal, JVM-level lock that does not support the virtual thread mount/unmount protocol, so any thread inside that lock, whether actively running the initializer or waiting for another thread to finish it, is pinned to its carrier for the whole duration, regardless of what kind of work the initializer does.
+
+Advice written before Java 24 says to replace synchronized blocks with a java.util.concurrent lock such as ReentrantLock, because a virtual thread blocking while holding a monitor acquired via synchronized could not unmount, while java-level locks could. That advice buys nothing here: there is no synchronized statement in this code to swap out. The pinning comes from the JVM's own internal class-initialization lock, which every class implicitly has and which no amount of rewriting application-level locking can bypass.
+
+Bonus, unplanted finding: the same load also produced "Waited for initialization of org.hibernate.grammars.hql.HqlLexer by another thread" events, since Hibernate lazily initializes its own query-parsing classes on first use. This confirms the defect pattern is general: any class touched for the first time by many concurrent virtual threads at once can pin, not just the one deliberately planted here.
