@@ -101,4 +101,16 @@ The trade-off is not free. ZGC's average GC cycle time (298.770ms) is far higher
 
 This test ran at a modest, fixed rate (50 req/s) on a single machine with no explicit CPU constraint, so it does not tell us how ZGC's concurrent CPU usage would behave under heavier load or in a CPU-limited container. Before committing to this change in a production-like environment, the same comparison should be re-run under realistic CPU allocation and at higher throughput to confirm the pause-time win does not come at the cost of reduced capacity under load.
 
+A direct measurement confirms one more trade-off: JVM startup time was
+essentially unchanged between collectors (13.713 seconds under G1 versus
+13.552 seconds under ZGC, measured from Spring Boot's own startup log line),
+but memory footprint was not. Process working set measured shortly after
+startup was approximately 236 MB under G1 versus approximately 518 MB under
+ZGC, more than double. This matches ZGC's documented design: it reserves and
+multi-maps larger virtual memory regions to support colored pointers and
+concurrent relocation, so a higher resident footprint is an expected,
+real cost of the collector, not measurement noise. Any memory-constrained
+or containerized deployment adopting ZGC needs to budget for this footprint
+increase up front, not discover it under pressure.
+
 Rollback: revert this branch's merge commit, or remove `-XX:+UseZGC` from the JVM launch flags to return to the default G1 collector. No code changes were made in this fix, so rollback carries no other risk.
