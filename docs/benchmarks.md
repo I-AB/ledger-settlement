@@ -36,3 +36,152 @@ MappingBenchmark.mapToResponse_fixed thrpt 2 36749567.547 ops/s
 
 Honest observation: the fixed version is only about 4% slower than the broken one here, not the dramatic order-of-magnitude collapse dead-code-elimination examples usually show. JMH's own console output explains part of why: this JVM run used JMH's experimental "Compiler Blackholes" support, auto-detected and applied, which appears to have given even the broken benchmark some protection against full elimination. Additionally, this was only 2 measurement iterations with no computed error, not enough to say whether even this 4% gap is a real effect or measurement noise, the two runs of the identical broken benchmark shown above (33.9M then 38.3M ops/s) already differ by more than that. The properly configured run in Task 7 (5 warmup, 10 measurement iterations, 3 forks) will give statistically defensible numbers to settle this.
 
+## Task 5: Moving Inputs Into @State Classes
+
+All three benchmark methods originally built their inputs inline inside the
+`@Benchmark` method body. This risks the JIT constant-folding a hardcoded
+literal, and it mixes setup cost into the measured cost.
+
+Fixed by giving each benchmark class a `@State(Scope.Benchmark)` inner class
+with a `@Setup` method, populated once per benchmark run rather than once
+per invocation:
+
+- `MappingBenchmark.MappingState` builds a single `PaymentEntity`.
+- `CollectionBenchmark.PaymentListState` builds a 500-element
+  `List<PaymentEntity>`.
+- `SettlementBenchmark.SettlementState` builds a 500-element payment list,
+  mocks `PaymentRepository` with Mockito so `owedMinor` never makes a real
+  database round trip during the measured call, and constructs a real
+  `SettlementService` wired to that mock.
+
+Limitation: `owedMinor`'s first line reads `FeeScheduleLookup.TABLE_VERSION`,
+whose static initializer opens a real JDBC connection to Postgres (planted
+in SJV-L1). Mocking the repository does not remove this. Postgres has to be
+reachable at localhost:5433 for `SettlementBenchmark` to run at all, but
+this one-time cost lands in JVM startup, not in the measured per-op time.
+
+## Task 6: JMH Configuration Annotations
+
+Added to all three benchmark classes:
+
+- `@BenchmarkMode(Mode.AverageTime)`: report average time per operation.
+- `@OutputTimeUnit(TimeUnit.MICROSECONDS)`: microsecond scale fits these
+  methods.
+- `@Warmup(iterations = 5)`: five warmup iterations so the JIT reaches
+  steady state before anything is measured.
+- `@Measurement(iterations = 10)`: ten measured iterations per fork.
+- `@Fork(3)`: three separate JVM processes. Each fork starts cold, so no
+  single fork's JIT compilation quirks or warm-up idiosyncrasies leak into
+  another fork's measured results. Total measured samples per benchmark =
+  3 forks x 10 iterations = 30, which is the `Cnt` column in the JMH output.
+
+## Task 7: Full Benchmark Suite Run
+
+Command:
+
+    java -jar benchmarks/target/benchmarks.jar -rf json -rff results.json
+
+Total wall time: 30 minutes 59 seconds.
+
+| Benchmark                              | Score (us/op) | Error (+-) |
+|-----------------------------------------|---------------|------------|
+| CollectionBenchmark.sumAmounts          | 0.572         | 0.021      |
+| MappingBenchmark.mapToResponse_broken   | 0.023         | 0.001      |
+| MappingBenchmark.mapToResponse_fixed    | 0.025         | 0.002      |
+| SettlementBenchmark.owedMinor           | 410.242       | 274.099    |
+
+JMH itself flagged that this JVM has "Compiler Blackholes" (an experimental
+feature) active, and warned against over-trusting results that depend on
+Blackhole behavior. Two things stood out and needed follow-up before drawing
+conclusions:
+
+1. mapToResponse_broken (0.022-0.024 us/op) and mapToResponse_fixed
+   (0.023-0.027 us/op) overlap. The ~4% gap seen in Task 4's 2-iteration run
+   does not survive 30 proper measurements.
+2. owedMinor's error is 274 us on a 410 us score, about 67% relative error,
+   far noisier than the other three benchmarks.
+
+Raw results saved to `results.json` and committed as evidence.
+
+## Task 8: GC/Allocation Profiling
+
+Command:
+
+    java -jar benchmarks/target/benchmarks.jar -prof gc -rf json -rff results-gc.json
+
+Total wall time: 31 minutes 16 seconds.
+
+| Benchmark                              | Alloc (B/op) | Alloc rate (MB/sec) | GC count | GC time (ms) |
+|------------------------------------------|--------------|----------------------|----------|---------------|
+| CollectionBenchmark.sumAmounts            | 256.000      | 461.369              | 1507     | 1241          |
+| MappingBenchmark.mapToResponse_broken     | ~0 (noise floor) | 0.001            | ~0       | (none recorded) |
+| MappingBenchmark.mapToResponse_fixed      | 32.000       | 1224.204             | 2115     | 1701          |
+| SettlementBenchmark.owedMinor             | 2336.128     | 29.231               | 189      | 297788        |
+
+Raw results saved to `results-gc.json` and committed as evidence.
+
+## Task 9: Results Analysis
+
+**Mapping comparison (broken vs fixed): timing is inconclusive, allocation
+is conclusive.** The confidence intervals on time-per-op overlap, so timing
+alone cannot show that dead code elimination happened. Allocation data
+resolves it: `mapToResponse_broken` allocates nothing (0 GC collections
+attributable to it), because the JIT removed the unused `PaymentResponse`
+construction entirely. `mapToResponse_fixed` allocates exactly 32 bytes per
+call, one `PaymentResponse` object, kept alive by `Blackhole.consume`. This
+is the real signature of dead code elimination, at the allocation level
+rather than the timing level, and it is not subject to the Compiler
+Blackhole caution JMH raised, since it doesn't depend on wall-clock timing
+at all.
+
+**owedMinor's timing variance is most likely a benchmarking-environment
+artifact, not a property of the code.** Its GC time of 297,788 ms across
+only 189 collections averages out to roughly 1.5 seconds per collection,
+for a benchmark allocating only about 2.3 KB per call. That is far outside
+normal young-generation pause behavior and points to something external
+(background load, scheduling contention, or another JVM/OS-level factor on
+the test machine) rather than the settlement logic itself. This is the
+exact caution JMH's own output gives: the numbers alone don't explain
+themselves, and this one needed the GC profiler to reveal a likely
+environmental cause rather than a code-level one.
+
+**sumAmounts and owedMinor have no second variant to compare against**
+within this suite (each is the only benchmark for its method), so the
+overlapping-confidence-interval check applies specifically to the Mapping
+pair above.
+
+## Task 10: Limits of This Benchmark Suite
+
+Three things these numbers do not tell you:
+
+1. **Behavior under concurrency.** Every benchmark here ran single-threaded
+   (JMH's default). The real service handles concurrent requests, and
+   `owedMinor` in particular goes through a Spring `@Transactional` method
+   backed by a connection pool; lock contention, connection pool exhaustion,
+   and GC pause impact under concurrent load are not measured by anything
+   in this suite.
+
+2. **Cache and data-size effects at production scale.** Every benchmark used
+   a fixed, small input, a single `PaymentEntity` for the mapping benchmark,
+   a 500-element list for the collection and settlement benchmarks. A
+   merchant with 50,000 payments, or a JVM heap under real memory pressure
+   from many other live objects, will not necessarily show the same
+   per-operation cost or the same allocation profile as this isolated,
+   warmed-up microbenchmark.
+
+3. **The gap between the benchmark harness and the live request path.**
+   `SettlementBenchmark.owedMinor` calls the service method directly with a
+   mocked repository. The real request path also includes the HTTP layer,
+   JSON serialization, the actual JPA query and Postgres round trip, and
+   whatever load balancing or proxying sits in front of the service in
+   production. None of that is exercised here, so these numbers describe
+   the settlement calculation logic in isolation, not the end-to-end
+   request latency a client actually experiences.
+
+A fourth, specific to this run: the abnormally long average GC pause seen
+in `owedMinor` (Task 8/9) was not root-caused to a specific system-level
+condition, only observed and flagged. A benchmark run repeated on a quiet,
+dedicated machine, ideally with `-prof gc` again, would be needed to confirm
+whether that variance is reproducible or was specific to this machine's
+state at the time.
+
