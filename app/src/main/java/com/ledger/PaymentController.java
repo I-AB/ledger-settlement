@@ -40,7 +40,7 @@ public class PaymentController {
         return new SettlementResponse(merchantId, service.owedMinor(merchantId));
     }
 
-    private static PaymentResponse toResponse(PaymentEntity entity) {
+    static PaymentResponse toResponse(PaymentEntity entity) {
         return new PaymentResponse(
                 entity.getId(), entity.getMerchantId(), entity.getAmountMinor(), entity.getCurrency());
     }

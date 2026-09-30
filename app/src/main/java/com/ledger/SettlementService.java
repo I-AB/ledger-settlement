@@ -39,10 +39,14 @@ public class SettlementService {
         if (payments.isEmpty()) {
             throw new MerchantNotFoundException(merchantId);
         }
-        long total = payments.stream().mapToLong(PaymentEntity::getAmountMinor).sum();
+        long total = sumAmounts(payments);
         BigDecimal fee = BigDecimal.valueOf(total)
                 .multiply(properties.feeRate())
                 .setScale(0, RoundingMode.DOWN);
         return total - fee.longValueExact();
+    }
+
+    static long sumAmounts(List<PaymentEntity> payments) {
+        return payments.stream().mapToLong(PaymentEntity::getAmountMinor).sum();
     }
 }
