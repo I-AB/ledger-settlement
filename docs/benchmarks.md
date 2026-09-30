@@ -19,3 +19,20 @@ One dependency snag worth recording: `app`'s `spring-boot-maven-plugin` repackag
 3. **Settlement calculation**: `SettlementService.owedMinor(String merchantId)`, as directed by the lab. This method deliberately stays on `long` minor units and `BigDecimal` rather than `double` throughout, because binary floating point cannot represent a decimal currency amount exactly (`0.1` has no exact binary representation), and an inexact fee calculation on money is a correctness bug, not just a performance concern. Benchmarked by calling the real method on a real `SettlementService` instance, with `PaymentRepository` mocked via Mockito to return a fixed in-memory payment list (avoiding a live database round trip inside the measured code) and `SettlementProperties` constructed directly (a plain record, no mocking needed).
 
    Limitation worth stating plainly: `owedMinor`'s first line reads `FeeScheduleLookup.TABLE_VERSION`, a static field whose initializer opens a real JDBC connection to Postgres (planted in SJV-L1). This means Postgres must be reachable at `localhost:5433` when the benchmark JVM starts, even though the repository itself is mocked. This one-time cost happens once per JVM fork during class loading, so it is expected to land inside JMH's warmup iterations and not pollute the measured results, but it is a real, stated dependency of this benchmark suite, not something hidden.
+
+
+## Task 3: Deliberately wrong benchmark (dead code elimination)
+
+`MappingBenchmark.mapToResponse_broken()` computes a `PaymentResponse` via `PaymentController.toResponse(entity)` and discards the result, nothing consumes it, nothing is returned.
+
+Quick run (1 fork, 2 warmup + 2 measurement iterations, 1s each, not yet statistically rigorous, just to see the shape of the number): MappingBenchmark.mapToResponse_broken thrpt 2 33902542.398 ops/s
+
+Approximately 34 million operations per second for a method that constructs an object and maps its fields is not a believable number for real work, no mapping logic executes in under 30 nanoseconds per call at that rate. This is the textbook signature of dead code elimination: the JIT determined the result of `toResponse(entity)` was never used and removed the call.
+
+## Task 4: Fixed with Blackhole
+
+Added `mapToResponse_fixed(Blackhole blackhole)`, identical to the broken version except the result is passed to `blackhole.consume(...)`, which tells the JIT the value is used and must not be eliminated. MappingBenchmark.mapToResponse_broken thrpt 2 38280635.774 ops/s
+MappingBenchmark.mapToResponse_fixed thrpt 2 36749567.547 ops/s
+
+Honest observation: the fixed version is only about 4% slower than the broken one here, not the dramatic order-of-magnitude collapse dead-code-elimination examples usually show. JMH's own console output explains part of why: this JVM run used JMH's experimental "Compiler Blackholes" support, auto-detected and applied, which appears to have given even the broken benchmark some protection against full elimination. Additionally, this was only 2 measurement iterations with no computed error, not enough to say whether even this 4% gap is a real effect or measurement noise, the two runs of the identical broken benchmark shown above (33.9M then 38.3M ops/s) already differ by more than that. The properly configured run in Task 7 (5 warmup, 10 measurement iterations, 3 forks) will give statistically defensible numbers to settle this.
+
